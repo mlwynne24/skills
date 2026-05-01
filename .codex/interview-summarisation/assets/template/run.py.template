@@ -1,0 +1,238 @@
+import argparse
+import asyncio
+import json
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from frontier_foundry import BatchItem, FoundryClient
+
+from config import CONFIG
+from excel_writer import (
+    FilterSummary,
+    MetadataColumn,
+    QuestionColumn,
+    RowResult,
+    append_results,
+    filter_against_grid,
+)
+from prompt import build_messages
+from readers import (
+    SUPPORTED_SUFFIXES,
+    UnsupportedExtensionError,
+    preflight_inputs,
+    read_transcript,
+)
+from schema import (
+    INTERVIEW_GRID_TITLE,
+    METADATA_COLUMNS,
+    QUESTION_COLUMNS,
+    InterviewGrid,
+)
+
+EXIT_SCHEMA_DRIFT = 2
+
+logger = logging.getLogger("interview_summarisation")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run interview-grid extraction.")
+    p.add_argument("--files", nargs="*", type=Path, default=None)
+    p.add_argument(
+        "--retry-errors",
+        dest="retry_errors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--limit", type=int, default=None)
+    return p.parse_args()
+
+
+def select_inputs(args: argparse.Namespace) -> list[Path]:
+    if args.files:
+        return [p for p in args.files if p.exists()]
+    if not CONFIG.inputs_dir.exists():
+        print(
+            f"inputs_dir={CONFIG.inputs_dir} does not exist. "
+            "Edit Config.inputs_dir in config.py (or set INPUTS_DIR env var) "
+            "to the folder containing your transcripts.",
+            file=sys.stderr,
+        )
+        return []
+    return sorted(
+        p for p in CONFIG.inputs_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+
+
+def report_filter(summary: FilterSummary, output_path: Path) -> None:
+    if not (summary.new or summary.retry or summary.skipped_done or summary.skipped_errors):
+        return
+    print(f"Existing grid at {output_path}:")
+    if summary.new:
+        print(f"  {len(summary.new)} new file(s) to process")
+    if summary.retry:
+        print(f"  {len(summary.retry)} prior error(s) to retry")
+    if summary.skipped_done:
+        print(f"  {len(summary.skipped_done)} already processed — skipping")
+    if summary.skipped_errors:
+        print(f"  {len(summary.skipped_errors)} prior error(s) skipped (--no-retry-errors)")
+
+
+def load_project_context() -> str:
+    if not CONFIG.project_context_path.exists():
+        return ""
+    return CONFIG.project_context_path.read_text(encoding="utf-8")
+
+
+async def process(files: list[Path], project_context: str) -> list[BatchItem]:
+    transcripts = [(p, read_transcript(p)) for p in files]
+
+    def build_request(item: tuple[Path, str]) -> Any:
+        return build_messages(item[1], project_context)
+
+    async with FoundryClient(
+        project_id=CONFIG.project_id, config=CONFIG.foundry_client
+    ) as client:
+        deployments = (await client.available_models()).deployments
+        names = {d.name for d in deployments}
+        if CONFIG.model not in names:
+            print(
+                f"Model '{CONFIG.model}' not in available deployments: {sorted(names)}. "
+                "Update CONFIG.model in config.py.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return await client.batch(
+            transcripts,
+            build_request,
+            InterviewGrid,
+            model=CONFIG.model,
+            max_completion_tokens=CONFIG.max_completion_tokens,
+            seed=CONFIG.seed,
+            progress=True,
+        )
+
+
+def to_row_results(items: list[BatchItem]) -> list[RowResult]:
+    out: list[RowResult] = []
+    for item in items:
+        path: Path = item.input[0]
+        if item.result is not None:
+            out.append(RowResult(filename=path.name, data=item.result.data.model_dump()))
+        else:
+            err = item.error
+            out.append(RowResult(
+                filename=path.name,
+                error_code=err.code if err else "unknown",
+                error_message=err.message if err else "",
+                request_id=err.request_id if err else "",
+            ))
+    return out
+
+
+def write_run_log(items: list[BatchItem], log_dir: Path, ts: str) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"run-{ts}.log"
+    jsonl_path = log_dir / f"responses-{ts}.jsonl"
+    with log_path.open("w", encoding="utf-8") as log, jsonl_path.open("w", encoding="utf-8") as raw:
+        for item in items:
+            path: Path = item.input[0]
+            if item.result:
+                log.write(f"OK   {path.name}  request_id={item.result.request_id}\n")
+                raw.write(json.dumps({
+                    "filename": path.name,
+                    "request_id": item.result.request_id,
+                    "data": item.result.data.model_dump(),
+                }) + "\n")
+            else:
+                err = item.error
+                log.write(
+                    f"FAIL {path.name}  code={err.code if err else '?'}  "
+                    f"message={(err.message if err else '')[:200]}\n"
+                )
+    return log_path
+
+
+def print_summary(items: list[BatchItem], output_path: Path, log_path: Path) -> None:
+    succeeded = sum(1 for i in items if i.result is not None)
+    failed = len(items) - succeeded
+    print()
+    print("=== Run summary ===")
+    print(f"Total processed: {len(items)}")
+    print(f"Succeeded:       {succeeded}")
+    print(f"Failed:          {failed}")
+    if failed:
+        for i in items:
+            if i.error:
+                path: Path = i.input[0]
+                print(f"  - {path.name}  {i.error.code}")
+    print(f"Output: {output_path}")
+    print(f"Log:    {log_path}")
+
+
+async def main_async() -> int:
+    args = parse_args()
+    files = select_inputs(args)
+    if not files:
+        print("No supported files found.", file=sys.stderr)
+        return 1
+    try:
+        preflight_inputs(files)
+    except UnsupportedExtensionError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if args.limit:
+        files = files[: args.limit]
+
+    # Skip files already in the output grid; honor --retry-errors for [error] rows.
+    # When --files is explicit, the user has overridden selection, so we don't filter.
+    if not args.files:
+        files, summary = filter_against_grid(
+            files, CONFIG.output_path, retry_errors=args.retry_errors
+        )
+        report_filter(summary, CONFIG.output_path)
+        if not files:
+            print("Nothing to do — all matching files are already in the grid.")
+            return 0
+
+    project_context = load_project_context()
+    items = await process(files, project_context)
+
+    template_path = Path(__file__).parent / "_template_grid.xlsx"
+    if not template_path.exists():
+        # Skill places the brand template alongside this script at scaffold time.
+        # If missing, fall back to a fresh book — drift handling will recreate headers.
+        template_path = CONFIG.output_path
+
+    drift = append_results(
+        output_path=CONFIG.output_path,
+        template_path=template_path,
+        title=INTERVIEW_GRID_TITLE,
+        metadata_cols=[MetadataColumn(name=n) for n in METADATA_COLUMNS],
+        question_cols=[QuestionColumn(name=n, theme=t) for n, t in QUESTION_COLUMNS],
+        results=to_row_results(items),
+    )
+    if drift.removed:
+        print(
+            f"Schema drift: xlsx has columns not in schema.py: {drift.removed}. "
+            f"Resolve before re-running.",
+            file=sys.stderr,
+        )
+        return EXIT_SCHEMA_DRIFT
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = write_run_log(items, CONFIG.logs_dir, ts)
+    print_summary(items, CONFIG.output_path, log_path)
+    return 0
+
+
+def main() -> None:
+    sys.exit(asyncio.run(main_async()))
+
+
+if __name__ == "__main__":
+    main()

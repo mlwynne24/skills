@@ -1,0 +1,20 @@
+[project]
+name = "{{PROJECT_SLUG}}-interview-summarisation"
+version = "0.1.0"
+description = "Interview-grid extraction for {{PROJECT_NAME}}"
+requires-python = ">=3.13"
+dependencies = [
+    "azure-foundry-client",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "pypdf>=5.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "tqdm>=4.66",
+]
+
+[tool.uv.sources]
+azure-foundry-client = { git = "ssh://git@github.com/Frontier-Economics/azure-foundry-client.git" }
+
+[tool.ruff]
+line-length = 100
